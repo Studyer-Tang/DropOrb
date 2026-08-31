@@ -1,0 +1,3 @@
+DropOrb demo text
+
+This file exists only to verify drag-and-drop detection and the action panel.

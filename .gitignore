@@ -1,0 +1,7 @@
+.DS_Store
+Thumbs.db
+*.log
+bin/
+obj/
+DropOrb.ci.exe
+DropOrb.exe

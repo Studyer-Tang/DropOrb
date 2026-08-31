@@ -1,0 +1,20 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  compile:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile DropOrb
+        shell: powershell
+        run: |
+          $sources = Get-ChildItem -LiteralPath '.\src' -Filter '*.cs' | ForEach-Object FullName
+          Add-Type -Path $sources -ReferencedAssemblies 'System.Windows.Forms','System.Drawing','System.Web.Extensions','System.IO.Compression','System.IO.Compression.FileSystem' -OutputAssembly '.\DropOrb.exe' -OutputType WindowsApplication
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DropOrb-windows
+          path: DropOrb.exe
