@@ -59,6 +59,7 @@ namespace DropOrb
 
             body.Controls.Add(Section("最懒的用法",
                 "Ctrl + Alt + D    处理当前剪贴板\r\n" +
+                "Ctrl + Alt + Space    打开快捷命令\r\n" +
                 "鼠标中键点球    同样处理剪贴板\r\n" +
                 "直接拖进小球    展开环形快速投递\r\n" +
                 "单击小球        打开临时架"));
@@ -95,6 +96,8 @@ namespace DropOrb
                 "净化链接可去掉常见广告跟踪参数"));
 
             body.Controls.Add(Section("快捷工具",
+                "快捷命令可搜索并回车执行常用操作\r\n" +
+                "可按需开启资源管理器右键“发送到 DropOrb”\r\n" +
                 "右键菜单可打开下载文件夹、新建桌面便签\r\n" +
                 "任务与撤销中心可查看后台工作和生成内容\r\n" +
                 "也可按需开启开机自动启动\r\n" +

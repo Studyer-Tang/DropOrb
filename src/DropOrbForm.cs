@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using System.Collections.Generic;
 
 namespace DropOrb
 {
@@ -22,6 +23,7 @@ namespace DropOrb
         private ShelfForm shelfForm;
         private HelpForm helpForm;
         private ActivityCenterForm activityForm;
+        private QuickCommandForm quickCommandForm;
         private readonly Timer animationTimer;
         private int animationAngle;
         private readonly Timer radialLeaveTimer;
@@ -35,8 +37,10 @@ namespace DropOrb
         private Point mouseDown;
         private bool moved;
         private bool hotkeyRegistered;
+        private bool commandHotkeyRegistered;
 
-        private const int HotkeyId = 0xD09;
+        private const int ClipboardHotkeyId = 0xD09;
+        private const int CommandHotkeyId = 0xD0A;
         private const int WmHotkey = 0x0312;
         private const uint ModAlt = 0x0001;
         private const uint ModControl = 0x0002;
@@ -76,6 +80,7 @@ namespace DropOrb
             Location = LoadLocation();
 
             var context = new ContextMenuStrip();
+            var commandItem = context.Items.Add("快捷命令  Ctrl+Alt+Space");
             var helpItem = context.Items.Add("功能说明");
             var clipboardItem = context.Items.Add("处理剪贴板  Ctrl+Alt+D");
             var shelfItem = context.Items.Add("打开临时架");
@@ -84,10 +89,13 @@ namespace DropOrb
             var noteItem = context.Items.Add("新建桌面便签");
             var startupItem = new ToolStripMenuItem("开机自动启动") { CheckOnClick = true };
             context.Items.Add(startupItem);
+            var sendToItem = new ToolStripMenuItem("文件管理器发送到") { CheckOnClick = true };
+            context.Items.Add(sendToItem);
             var resetPreferenceItem = context.Items.Add("重置动作偏好");
             var hideItem = context.Items.Add("隐藏投递球");
             context.Items.Add(new ToolStripSeparator());
             var exitItem = context.Items.Add("退出 DropOrb");
+            commandItem.Click += delegate { ShowQuickCommands(); };
             helpItem.Click += delegate { ShowHelp(); };
             clipboardItem.Click += delegate { ProcessClipboard(); };
             shelfItem.Click += delegate { ShowShelf(); };
@@ -95,18 +103,21 @@ namespace DropOrb
             downloadsItem.Click += delegate { OpenDownloads(); };
             noteItem.Click += delegate { CreateQuickNote(); };
             startupItem.Click += delegate { SetStartup(startupItem.Checked); };
+            sendToItem.Click += delegate { SetSendTo(sendToItem.Checked); };
             resetPreferenceItem.Click += delegate { ResetPreferences(); };
             hideItem.Click += delegate { Hide(); };
             exitItem.Click += delegate { allowExit = true; Close(); };
             context.Opening += delegate
             {
                 startupItem.Checked = IsStartupEnabled();
+                sendToItem.Checked = SendToIntegration.IsInstalled;
                 activityItem.Text = ActivityTitle();
             };
             ContextMenuStrip = context;
 
             var trayMenu = new ContextMenuStrip();
             var showTray = trayMenu.Items.Add("显示投递球");
+            var commandTray = trayMenu.Items.Add("快捷命令  Ctrl+Alt+Space");
             var helpTray = trayMenu.Items.Add("功能说明");
             var clipboardTray = trayMenu.Items.Add("处理剪贴板  Ctrl+Alt+D");
             var shelfTray = trayMenu.Items.Add("临时架");
@@ -115,9 +126,12 @@ namespace DropOrb
             var noteTray = trayMenu.Items.Add("新建桌面便签");
             var startupTray = new ToolStripMenuItem("开机自动启动") { CheckOnClick = true };
             trayMenu.Items.Add(startupTray);
+            var sendToTray = new ToolStripMenuItem("文件管理器发送到") { CheckOnClick = true };
+            trayMenu.Items.Add(sendToTray);
             trayMenu.Items.Add(new ToolStripSeparator());
             var exitTray = trayMenu.Items.Add("退出");
             showTray.Click += delegate { ShowOrb(); };
+            commandTray.Click += delegate { ShowQuickCommands(); };
             helpTray.Click += delegate { ShowHelp(); };
             clipboardTray.Click += delegate { ProcessClipboard(); };
             shelfTray.Click += delegate { ShowShelf(); };
@@ -125,10 +139,12 @@ namespace DropOrb
             downloadsTray.Click += delegate { OpenDownloads(); };
             noteTray.Click += delegate { CreateQuickNote(); };
             startupTray.Click += delegate { SetStartup(startupTray.Checked); };
+            sendToTray.Click += delegate { SetSendTo(sendToTray.Checked); };
             exitTray.Click += delegate { allowExit = true; Close(); };
             trayMenu.Opening += delegate
             {
                 startupTray.Checked = IsStartupEnabled();
+                sendToTray.Checked = SendToIntegration.IsInstalled;
                 activityTray.Text = ActivityTitle();
             };
             trayIcon = new NotifyIcon { Icon = SystemIcons.Application, Text = "DropOrb · 拖进来，马上处理", ContextMenuStrip = trayMenu, Visible = true };
@@ -163,8 +179,10 @@ namespace DropOrb
                 trayIcon.BalloonTipTitle = "DropOrb 已启动";
                 trayIcon.BalloonTipText = "拖入文件，或按 Ctrl+Alt+D 直接处理剪贴板。";
                 trayIcon.ShowBalloonTip(2600);
+                if (Program.InitialPaths != null && Program.InitialPaths.Length > 0) ProcessExternalArguments(Program.InitialPaths);
                 if (Program.InspectHelp) ShowHelp();
                 if (Program.InspectActivity) ShowActivityCenter();
+                if (Program.InspectCommand) ShowQuickCommands();
                 if (!string.IsNullOrWhiteSpace(Program.InspectRadialPath))
                 {
                     var radialData = new DataObject();
@@ -452,9 +470,14 @@ namespace DropOrb
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == WmHotkey && m.WParam.ToInt32() == HotkeyId)
+            if (m.Msg == WmHotkey && m.WParam.ToInt32() == ClipboardHotkeyId)
             {
                 ProcessClipboard();
+                return;
+            }
+            if (m.Msg == WmHotkey && m.WParam.ToInt32() == CommandHotkeyId)
+            {
+                ShowQuickCommands();
                 return;
             }
             base.WndProc(ref m);
@@ -468,13 +491,16 @@ namespace DropOrb
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            hotkeyRegistered = RegisterHotKey(Handle, HotkeyId, ModControl | ModAlt, Keys.D);
+            hotkeyRegistered = RegisterHotKey(Handle, ClipboardHotkeyId, ModControl | ModAlt, Keys.D);
+            commandHotkeyRegistered = RegisterHotKey(Handle, CommandHotkeyId, ModControl | ModAlt, Keys.Space);
         }
 
         protected override void OnHandleDestroyed(EventArgs e)
         {
-            if (hotkeyRegistered) UnregisterHotKey(Handle, HotkeyId);
+            if (hotkeyRegistered) UnregisterHotKey(Handle, ClipboardHotkeyId);
+            if (commandHotkeyRegistered) UnregisterHotKey(Handle, CommandHotkeyId);
             hotkeyRegistered = false;
+            commandHotkeyRegistered = false;
             base.OnHandleDestroyed(e);
         }
 
@@ -549,6 +575,78 @@ namespace DropOrb
                 if (enabled) key.SetValue("DropOrb", "\"" + Application.ExecutablePath + "\"");
                 else key.DeleteValue("DropOrb", false);
             }
+        }
+
+        private void SetSendTo(bool enabled)
+        {
+            try
+            {
+                SendToIntegration.SetInstalled(enabled);
+                Toast(enabled ? "已加入文件管理器" : "已移除文件管理器入口",
+                    enabled ? "选中文件后，右键“发送到”即可交给 DropOrb。" : "不会影响 DropOrb 的其他入口。");
+            }
+            catch (Exception error)
+            {
+                MessageBox.Show(this, error.Message, "DropOrb 无法更新“发送到”", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        internal void ProcessExternalArguments(string[] paths)
+        {
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action<string[]>(ProcessExternalArguments), new object[] { paths });
+                return;
+            }
+            if (paths == null || paths.Length == 0)
+            {
+                ShowOrb();
+                return;
+            }
+            var existing = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Distinct(
+                System.Linq.Enumerable.Where(paths, path => File.Exists(path) || Directory.Exists(path)), StringComparer.OrdinalIgnoreCase));
+            if (existing.Length == 0)
+            {
+                Toast("没有可处理的内容", "所选文件可能已被移动或删除。");
+                return;
+            }
+            try
+            {
+                var data = new DataObject();
+                data.SetData(DataFormats.FileDrop, existing);
+                ShowOrb();
+                ShowActionPanel(DropItem.FromData(data));
+            }
+            catch (Exception error)
+            {
+                MessageBox.Show(this, error.Message, "DropOrb 无法接收文件", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void ShowQuickCommands()
+        {
+            if (quickCommandForm != null && !quickCommandForm.IsDisposed)
+            {
+                quickCommandForm.Activate();
+                return;
+            }
+            var commands = new List<QuickCommand>
+            {
+                new QuickCommand("处理剪贴板", "识别刚复制的文件、图片、文字或链接", ProcessClipboard),
+                new QuickCommand("打开下载文件夹", "直接进入常用下载目录", OpenDownloads),
+                new QuickCommand("新建桌面便签", "创建并打开一个随手记文本", CreateQuickNote),
+                new QuickCommand("打开临时架", "找回暂存的文件、文字和链接", ShowShelf),
+                new QuickCommand("任务与撤销", "查看后台工作并撤销新生成内容", ShowActivityCenter),
+                new QuickCommand("功能说明", "查看 DropOrb 的全部懒人用法", ShowHelp),
+                new QuickCommand("隐藏投递球", "小球进入托盘，快捷键仍然可用", Hide)
+            };
+            quickCommandForm = new QuickCommandForm(commands);
+            var work = Screen.FromPoint(Cursor.Position).WorkingArea;
+            quickCommandForm.Location = new Point(work.Left + (work.Width - quickCommandForm.Width) / 2,
+                work.Top + Math.Max(50, (work.Height - quickCommandForm.Height) / 3));
+            quickCommandForm.FormClosed += delegate { quickCommandForm = null; };
+            quickCommandForm.Show();
+            quickCommandForm.Activate();
         }
 
         private void ShowShelf()
@@ -686,6 +784,7 @@ namespace DropOrb
             radialLeaveTimer.Stop();
             radialLeaveTimer.Dispose();
             jobs.Completed -= OnJobCompleted;
+            if (quickCommandForm != null && !quickCommandForm.IsDisposed) quickCommandForm.Close();
             trayIcon.Visible = false;
             trayIcon.Dispose();
         }
