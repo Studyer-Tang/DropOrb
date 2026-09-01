@@ -113,9 +113,24 @@ namespace DropOrb
 
     internal sealed class ActionSpec
     {
+        public string Id { get; set; }
         public string Title { get; set; }
         public string Hint { get; set; }
         public Action<DropItem, IWin32Window> Execute { get; set; }
+        public Func<DropItem, ActionResult> BackgroundExecute { get; set; }
+        public bool IsBackground { get { return BackgroundExecute != null; } }
+    }
+
+    internal sealed class ActionResult
+    {
+        public ActionResult()
+        {
+            Outputs = new List<string>();
+        }
+
+        public string Message { get; set; }
+        public string ClipboardText { get; set; }
+        public List<string> Outputs { get; set; }
     }
 
     internal sealed class ShelfEntry

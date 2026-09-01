@@ -16,35 +16,42 @@ namespace DropOrb
     internal sealed class ActionEngine
     {
         private readonly ShelfStore shelf;
+        private readonly PreferenceStore preferences;
 
-        public ActionEngine(ShelfStore shelfStore)
+        public ActionEngine(ShelfStore shelfStore, PreferenceStore preferenceStore)
         {
             shelf = shelfStore;
+            preferences = preferenceStore;
         }
 
         public List<ActionSpec> GetActions(DropItem item)
         {
+            List<ActionSpec> actions;
             switch (item.Kind)
             {
-                case DropKind.Image: return ImageActions();
-                case DropKind.Archive: return ArchiveActions();
-                case DropKind.Folder: return FolderActions();
-                case DropKind.Url: return UrlActions();
-                case DropKind.Text: return TextActions();
-                case DropKind.Pdf: return PdfActions();
-                case DropKind.Files: return MultipleActions();
-                default: return GenericActions();
+                case DropKind.Image: actions = ImageActions(); break;
+                case DropKind.Archive: actions = ArchiveActions(); break;
+                case DropKind.Folder: actions = FolderActions(); break;
+                case DropKind.Url: actions = UrlActions(); break;
+                case DropKind.Text: actions = TextActions(); break;
+                case DropKind.Pdf: actions = PdfActions(); break;
+                case DropKind.Files: actions = MultipleActions(); break;
+                default: actions = GenericActions(); break;
             }
+            return preferences.Order(item.Kind, actions);
         }
+
+        public void Remember(DropKind kind, ActionSpec action) { preferences.Remember(kind, action); }
+        public void ResetPreferences() { preferences.Reset(); }
 
         private List<ActionSpec> ImageActions()
         {
             return new List<ActionSpec>
             {
                 Spec("置顶预览", "把图片钉在桌面上", (item, owner) => PinImages(item)),
-                Spec("缩小到 50%", "生成尺寸减半的副本", (item, owner) => ResizeImages(item, owner)),
-                Spec("转换格式", "PNG 与 JPG 互转", (item, owner) => ConvertImages(item, owner)),
-                Spec("压缩副本", "生成较小的 JPG 副本", (item, owner) => CompressImages(item, owner)),
+                BackgroundSpec("缩小到 50%", "在后台生成尺寸减半副本", ResizeImagesWork),
+                BackgroundSpec("转换格式", "在后台完成 PNG/JPG 互转", ConvertImagesWork),
+                BackgroundSpec("压缩副本", "在后台生成较小 JPG", CompressImagesWork),
                 Spec("复制图片", "复制第一张到剪贴板", (item, owner) => CopyImage(item)),
                 Spec("打开位置", "在资源管理器中定位", (item, owner) => OpenContaining(item.PrimaryPath))
             };
@@ -56,7 +63,7 @@ namespace DropOrb
             {
                 Spec("解压并打开", "安全解压到同名文件夹", (item, owner) => ExtractZip(item.PrimaryPath)),
                 Spec("预览内容", "先看看压缩包里有什么", (item, owner) => PreviewZip(item.PrimaryPath, owner)),
-                Spec("复制到桌面", "生成一份不覆盖的副本", (item, owner) => CopyToDesktop(item, owner)),
+                BackgroundSpec("复制到桌面", "后台生成一份不覆盖的副本", CopyToDesktopWork),
                 Spec("计算 SHA-256", "校验下载文件是否完整", (item, owner) => CopyHashes(item, owner)),
                 ShelfSpec(),
                 Spec("打开位置", "在资源管理器中定位", (item, owner) => OpenContaining(item.PrimaryPath))
@@ -67,11 +74,11 @@ namespace DropOrb
         {
             return new List<ActionSpec>
             {
-                Spec("打包 ZIP", "生成一个新的压缩包", (item, owner) => ZipFolder(item.PrimaryPath)),
+                BackgroundSpec("打包 ZIP", "在后台生成新的压缩包", item => ZipFolderWork(item.PrimaryPath)),
                 Spec("生成目录树", "输出可复制的 TXT 目录", (item, owner) => GenerateTree(item.PrimaryPath)),
                 Spec("复制文件名", "复制第一层所有名称", (item, owner) => CopyNames(item.PrimaryPath)),
                 Spec("复制完整路径", "直接放进剪贴板", (item, owner) => Clipboard.SetText(item.PrimaryPath)),
-                Spec("复制到桌面", "生成一份不覆盖的副本", (item, owner) => CopyToDesktop(item, owner)),
+                BackgroundSpec("复制到桌面", "后台生成一份不覆盖的副本", CopyToDesktopWork),
                 ShelfSpec()
             };
         }
@@ -106,7 +113,7 @@ namespace DropOrb
             return new List<ActionSpec>
             {
                 Spec("打开 PDF", "使用默认阅读器", (item, owner) => OpenPath(item.PrimaryPath)),
-                Spec("复制到桌面", "生成一份不覆盖的副本", (item, owner) => CopyToDesktop(item, owner)),
+                BackgroundSpec("复制到桌面", "后台生成一份不覆盖的副本", CopyToDesktopWork),
                 Spec("计算 SHA-256", "复制文件校验值", (item, owner) => CopyHashes(item, owner)),
                 ShelfSpec(),
                 Spec("复制路径", "复制完整文件路径", (item, owner) => Clipboard.SetText(item.PrimaryPath)),
@@ -119,8 +126,8 @@ namespace DropOrb
             return new List<ActionSpec>
             {
                 Spec("打开", "使用默认程序打开", (item, owner) => OpenPath(item.PrimaryPath)),
-                Spec("复制到桌面", "生成一份不覆盖的副本", (item, owner) => CopyToDesktop(item, owner)),
-                Spec("打包 ZIP", "在旁边生成压缩副本", (item, owner) => ZipSingleFile(item.PrimaryPath)),
+                BackgroundSpec("复制到桌面", "后台生成一份不覆盖的副本", CopyToDesktopWork),
+                BackgroundSpec("打包 ZIP", "在后台生成压缩副本", item => ZipSingleFileWork(item.PrimaryPath)),
                 Spec("计算 SHA-256", "复制文件校验值", (item, owner) => CopyHashes(item, owner)),
                 ShelfSpec(),
                 Spec("打开位置", "在资源管理器中定位", (item, owner) => OpenContaining(item.PrimaryPath))
@@ -131,10 +138,10 @@ namespace DropOrb
         {
             return new List<ActionSpec>
             {
-                Spec("打包为一个 ZIP", "文件和文件夹一起收好", (item, owner) => ZipItems(item, owner)),
+                BackgroundSpec("打包为一个 ZIP", "在后台把文件和文件夹收好", ZipItemsWork),
                 Spec("复制所有名称", "只复制文件名", (item, owner) => Clipboard.SetText(string.Join(Environment.NewLine, item.Paths.Select(path => Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar))).ToArray()))),
                 Spec("复制所有路径", "每行一个完整路径", (item, owner) => Clipboard.SetText(string.Join(Environment.NewLine, item.Paths.ToArray()))),
-                Spec("全部复制到桌面", "自动避开同名文件", (item, owner) => CopyToDesktop(item, owner)),
+                BackgroundSpec("全部复制到桌面", "后台复制并自动避开同名", CopyToDesktopWork),
                 ShelfSpec(),
                 Spec("打开第一个位置", "在资源管理器中定位", (item, owner) => OpenContaining(item.PrimaryPath))
             };
@@ -151,7 +158,12 @@ namespace DropOrb
 
         private static ActionSpec Spec(string title, string hint, Action<DropItem, IWin32Window> action)
         {
-            return new ActionSpec { Title = title, Hint = hint, Execute = action };
+            return new ActionSpec { Id = title, Title = title, Hint = hint, Execute = action };
+        }
+
+        private static ActionSpec BackgroundSpec(string title, string hint, Func<DropItem, ActionResult> action)
+        {
+            return new ActionSpec { Id = title, Title = title, Hint = hint, BackgroundExecute = action };
         }
 
         private static void PinImages(DropItem item)
@@ -159,7 +171,7 @@ namespace DropOrb
             foreach (var path in item.Paths.Where(File.Exists).Take(6)) new PinnedImageForm(path).Show();
         }
 
-        private static void ResizeImages(DropItem item, IWin32Window owner)
+        private static ActionResult ResizeImagesWork(DropItem item)
         {
             var outputs = new List<string>();
             foreach (var source in item.Paths.Where(File.Exists))
@@ -179,7 +191,7 @@ namespace DropOrb
                     outputs.Add(target);
                 }
             }
-            ShowOutputs(owner, "缩小副本已生成", outputs);
+            return new ActionResult { Message = "已生成 " + outputs.Count + " 张图片", Outputs = outputs };
         }
 
         private static void CopyImage(DropItem item)
@@ -187,7 +199,7 @@ namespace DropOrb
             using (var image = Image.FromFile(item.PrimaryPath)) Clipboard.SetImage(new Bitmap(image));
         }
 
-        private static void ConvertImages(DropItem item, IWin32Window owner)
+        private static ActionResult ConvertImagesWork(DropItem item)
         {
             var outputs = new List<string>();
             foreach (var source in item.Paths.Where(File.Exists))
@@ -201,10 +213,10 @@ namespace DropOrb
                 }
                 outputs.Add(target);
             }
-            ShowOutputs(owner, "转换完成", outputs);
+            return new ActionResult { Message = "已转换 " + outputs.Count + " 张图片", Outputs = outputs };
         }
 
-        private static void CompressImages(DropItem item, IWin32Window owner)
+        private static ActionResult CompressImagesWork(DropItem item)
         {
             var outputs = new List<string>();
             foreach (var source in item.Paths.Where(File.Exists))
@@ -213,7 +225,7 @@ namespace DropOrb
                 using (var image = Image.FromFile(source)) SaveJpeg(image, target, 72L);
                 outputs.Add(target);
             }
-            ShowOutputs(owner, "压缩副本已生成", outputs);
+            return new ActionResult { Message = "已压缩 " + outputs.Count + " 张图片", Outputs = outputs };
         }
 
         private static void SaveJpeg(Image image, string target, long quality)
@@ -258,21 +270,21 @@ namespace DropOrb
             }
         }
 
-        private static void ZipFolder(string folder)
+        private static ActionResult ZipFolderWork(string folder)
         {
             var target = UniquePath(folder.TrimEnd(Path.DirectorySeparatorChar) + ".zip");
             ZipFile.CreateFromDirectory(folder, target, CompressionLevel.Optimal, false);
-            OpenContaining(target);
+            return Result("压缩完成", target);
         }
 
-        private static void ZipSingleFile(string source)
+        private static ActionResult ZipSingleFileWork(string source)
         {
             var target = UniquePath(Path.Combine(Path.GetDirectoryName(source), Path.GetFileNameWithoutExtension(source) + ".zip"));
             using (var archive = ZipFile.Open(target, ZipArchiveMode.Create)) archive.CreateEntryFromFile(source, Path.GetFileName(source), CompressionLevel.Optimal);
-            OpenContaining(target);
+            return Result("压缩完成", target);
         }
 
-        private static void ZipItems(DropItem item, IWin32Window owner)
+        private static ActionResult ZipItemsWork(DropItem item)
         {
             var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
             var target = UniquePath(Path.Combine(desktop, "DropOrb-bundle-" + DateTime.Now.ToString("yyyyMMdd-HHmm") + ".zip"));
@@ -285,7 +297,7 @@ namespace DropOrb
                     else if (Directory.Exists(path)) AddDirectoryToArchive(archive, path, Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar)), used);
                 }
             }
-            ShowOutputs(owner, "压缩包已生成", new[] { target });
+            return Result("压缩完成", target);
         }
 
         private static void AddDirectoryToArchive(ZipArchive archive, string folder, string prefix, HashSet<string> used)
@@ -314,7 +326,7 @@ namespace DropOrb
             archive.CreateEntryFromFile(source, candidate, CompressionLevel.Optimal);
         }
 
-        private static void CopyToDesktop(DropItem item, IWin32Window owner)
+        private static ActionResult CopyToDesktopWork(DropItem item)
         {
             var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
             var outputs = new List<string>();
@@ -327,7 +339,7 @@ namespace DropOrb
                 else continue;
                 outputs.Add(target);
             }
-            ShowOutputs(owner, "已复制到桌面", outputs);
+            return new ActionResult { Message = "已复制 " + outputs.Count + " 项", Outputs = outputs };
         }
 
         private static void CopyDirectory(string source, string destination)
@@ -473,10 +485,9 @@ namespace DropOrb
             return UniquePath(desired);
         }
 
-        private static void ShowOutputs(IWin32Window owner, string title, IList<string> outputs)
+        private static ActionResult Result(string message, params string[] outputs)
         {
-            MessageBox.Show(owner, title + "：" + Environment.NewLine + string.Join(Environment.NewLine, outputs.Select(Path.GetFileName).ToArray()), "DropOrb", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            if (outputs.Count > 0) OpenContaining(outputs[0]);
+            return new ActionResult { Message = message, Outputs = outputs.ToList() };
         }
     }
 }

@@ -14,10 +14,22 @@ namespace DropOrb
     {
         private readonly ShelfStore shelf;
         private readonly ActionEngine engine;
+        private readonly PreferenceStore preferences;
+        private readonly UndoStore undoStore;
+        private readonly JobManager jobs;
         private readonly NotifyIcon trayIcon;
         private readonly string settingsPath;
         private ShelfForm shelfForm;
         private HelpForm helpForm;
+        private ActivityCenterForm activityForm;
+        private readonly Timer animationTimer;
+        private int animationAngle;
+        private readonly Timer radialLeaveTimer;
+        private bool radialMode;
+        private Rectangle compactBounds;
+        private Point radialHover;
+        private DropItem radialItem;
+        private System.Collections.Generic.IList<ActionSpec> radialActions;
         private bool dragHover;
         private bool allowExit;
         private Point mouseDown;
@@ -43,9 +55,13 @@ namespace DropOrb
 
         public DropOrbForm()
         {
+            var dataDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DropOrb");
             shelf = new ShelfStore();
-            engine = new ActionEngine(shelf);
-            settingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DropOrb", "settings.json");
+            preferences = new PreferenceStore(dataDirectory);
+            undoStore = new UndoStore(dataDirectory);
+            jobs = new JobManager(undoStore);
+            engine = new ActionEngine(shelf, preferences);
+            settingsPath = Path.Combine(dataDirectory, "settings.json");
             Text = "DropOrb";
             ClientSize = new Size(78, 78);
             FormBorderStyle = FormBorderStyle.None;
@@ -56,33 +72,37 @@ namespace DropOrb
             DoubleBuffered = true;
             AllowDrop = true;
             Opacity = 0.97;
-            using (var circle = new GraphicsPath())
-            {
-                circle.AddEllipse(0, 0, Width, Height);
-                Region = new Region(circle);
-            }
+            ApplyCircleRegion();
             Location = LoadLocation();
 
             var context = new ContextMenuStrip();
             var helpItem = context.Items.Add("功能说明");
             var clipboardItem = context.Items.Add("处理剪贴板  Ctrl+Alt+D");
             var shelfItem = context.Items.Add("打开临时架");
+            var activityItem = context.Items.Add("任务与撤销");
             var downloadsItem = context.Items.Add("打开下载文件夹");
             var noteItem = context.Items.Add("新建桌面便签");
             var startupItem = new ToolStripMenuItem("开机自动启动") { CheckOnClick = true };
             context.Items.Add(startupItem);
+            var resetPreferenceItem = context.Items.Add("重置动作偏好");
             var hideItem = context.Items.Add("隐藏投递球");
             context.Items.Add(new ToolStripSeparator());
             var exitItem = context.Items.Add("退出 DropOrb");
             helpItem.Click += delegate { ShowHelp(); };
             clipboardItem.Click += delegate { ProcessClipboard(); };
             shelfItem.Click += delegate { ShowShelf(); };
+            activityItem.Click += delegate { ShowActivityCenter(); };
             downloadsItem.Click += delegate { OpenDownloads(); };
             noteItem.Click += delegate { CreateQuickNote(); };
             startupItem.Click += delegate { SetStartup(startupItem.Checked); };
+            resetPreferenceItem.Click += delegate { ResetPreferences(); };
             hideItem.Click += delegate { Hide(); };
             exitItem.Click += delegate { allowExit = true; Close(); };
-            context.Opening += delegate { startupItem.Checked = IsStartupEnabled(); };
+            context.Opening += delegate
+            {
+                startupItem.Checked = IsStartupEnabled();
+                activityItem.Text = ActivityTitle();
+            };
             ContextMenuStrip = context;
 
             var trayMenu = new ContextMenuStrip();
@@ -90,6 +110,7 @@ namespace DropOrb
             var helpTray = trayMenu.Items.Add("功能说明");
             var clipboardTray = trayMenu.Items.Add("处理剪贴板  Ctrl+Alt+D");
             var shelfTray = trayMenu.Items.Add("临时架");
+            var activityTray = trayMenu.Items.Add("任务与撤销");
             var downloadsTray = trayMenu.Items.Add("打开下载文件夹");
             var noteTray = trayMenu.Items.Add("新建桌面便签");
             var startupTray = new ToolStripMenuItem("开机自动启动") { CheckOnClick = true };
@@ -100,16 +121,37 @@ namespace DropOrb
             helpTray.Click += delegate { ShowHelp(); };
             clipboardTray.Click += delegate { ProcessClipboard(); };
             shelfTray.Click += delegate { ShowShelf(); };
+            activityTray.Click += delegate { ShowActivityCenter(); };
             downloadsTray.Click += delegate { OpenDownloads(); };
             noteTray.Click += delegate { CreateQuickNote(); };
             startupTray.Click += delegate { SetStartup(startupTray.Checked); };
             exitTray.Click += delegate { allowExit = true; Close(); };
-            trayMenu.Opening += delegate { startupTray.Checked = IsStartupEnabled(); };
+            trayMenu.Opening += delegate
+            {
+                startupTray.Checked = IsStartupEnabled();
+                activityTray.Text = ActivityTitle();
+            };
             trayIcon = new NotifyIcon { Icon = SystemIcons.Application, Text = "DropOrb · 拖进来，马上处理", ContextMenuStrip = trayMenu, Visible = true };
             trayIcon.DoubleClick += delegate { ShowOrb(); };
+            jobs.Completed += OnJobCompleted;
+            animationTimer = new Timer { Interval = 90 };
+            animationTimer.Tick += delegate
+            {
+                if (jobs.RunningCount == 0) return;
+                animationAngle = (animationAngle + 12) % 360;
+                Invalidate();
+            };
+            animationTimer.Start();
+            radialLeaveTimer = new Timer { Interval = 140 };
+            radialLeaveTimer.Tick += delegate
+            {
+                radialLeaveTimer.Stop();
+                if (radialMode && !Bounds.Contains(Cursor.Position)) ExitRadialMode();
+            };
 
             DragEnter += OnDragEnter;
-            DragLeave += delegate { dragHover = false; Invalidate(); };
+            DragOver += OnDragOver;
+            DragLeave += delegate { radialLeaveTimer.Stop(); radialLeaveTimer.Start(); };
             DragDrop += OnDragDrop;
             MouseDown += OnOrbMouseDown;
             MouseMove += OnOrbMouseMove;
@@ -122,6 +164,15 @@ namespace DropOrb
                 trayIcon.BalloonTipText = "拖入文件，或按 Ctrl+Alt+D 直接处理剪贴板。";
                 trayIcon.ShowBalloonTip(2600);
                 if (Program.InspectHelp) ShowHelp();
+                if (Program.InspectActivity) ShowActivityCenter();
+                if (!string.IsNullOrWhiteSpace(Program.InspectRadialPath))
+                {
+                    var radialData = new DataObject();
+                    radialData.SetData(DataFormats.FileDrop, new[] { Program.InspectRadialPath });
+                    radialItem = DropItem.FromData(radialData);
+                    radialActions = engine.GetActions(radialItem);
+                    EnterRadialMode();
+                }
                 if (!string.IsNullOrWhiteSpace(Program.InspectDropPath))
                 {
                     try
@@ -141,12 +192,26 @@ namespace DropOrb
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
+            if (radialMode)
+            {
+                PaintRadial(e.Graphics);
+                return;
+            }
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             var outer = new Rectangle(4, 4, 70, 70);
             using (var shadow = new SolidBrush(Color.FromArgb(70, 0, 0, 0))) g.FillEllipse(shadow, 5, 7, 68, 68);
             using (var gradient = new LinearGradientBrush(outer, dragHover ? Theme.Cyan : Theme.Blue, Theme.Violet, 45f)) g.FillEllipse(gradient, outer);
             using (var glow = new Pen(Color.FromArgb(dragHover ? 230 : 95, Color.White), dragHover ? 3f : 1.5f)) g.DrawEllipse(glow, outer);
+            if (jobs.RunningCount > 0)
+            {
+                using (var progress = new Pen(Theme.Cyan, 3.5f))
+                {
+                    progress.StartCap = LineCap.Round;
+                    progress.EndCap = LineCap.Round;
+                    g.DrawArc(progress, 2, 2, 74, 74, animationAngle, 105);
+                }
+            }
             if (dragHover)
             {
                 using (var font = new Font("Segoe UI", 20, FontStyle.Bold)) using (var brush = new SolidBrush(Color.White)) using (var format = Centered()) g.DrawString("+", font, brush, ClientRectangle, format);
@@ -169,10 +234,11 @@ namespace DropOrb
         {
             try
             {
-                DropItem.FromData(args.Data);
+                radialItem = DropItem.FromData(args.Data);
+                radialActions = engine.GetActions(radialItem);
                 args.Effect = DragDropEffects.Copy;
                 dragHover = true;
-                Invalidate();
+                EnterRadialMode();
             }
             catch
             {
@@ -180,13 +246,25 @@ namespace DropOrb
             }
         }
 
+        private void OnDragOver(object sender, DragEventArgs args)
+        {
+            args.Effect = DragDropEffects.Copy;
+            radialLeaveTimer.Stop();
+            radialHover = PointToClient(new Point(args.X, args.Y));
+            Invalidate();
+        }
+
         private void OnDragDrop(object sender, DragEventArgs args)
         {
+            var dropPoint = PointToClient(new Point(args.X, args.Y));
             dragHover = false;
-            Invalidate();
+            radialLeaveTimer.Stop();
             try
             {
-                var item = DropItem.FromData(args.Data);
+                var item = radialItem ?? DropItem.FromData(args.Data);
+                var actions = radialActions ?? engine.GetActions(item);
+                var zone = radialMode ? RadialZone(dropPoint) : "more";
+                ExitRadialMode();
                 var modifiers = Control.ModifierKeys;
                 if ((modifiers & Keys.Control) == Keys.Control)
                 {
@@ -194,17 +272,34 @@ namespace DropOrb
                     Toast("已加入临时架", "原文件没有移动。 ");
                     return;
                 }
-                var actions = engine.GetActions(item);
                 if ((modifiers & Keys.Shift) == Keys.Shift && actions.Count > 0)
                 {
-                    actions[0].Execute(item, this);
+                    ExecuteQuickAction(item, actions[0]);
                     return;
                 }
-                ShowActionPanel(item, actions);
+                if (zone == "shelf")
+                {
+                    shelf.Add(item);
+                    Toast("已加入临时架", "原文件没有移动。 ");
+                }
+                else if (zone == "recommend" && actions.Count > 0) ExecuteQuickAction(item, actions[0]);
+                else if (zone == "desktop")
+                {
+                    var desktopAction = System.Linq.Enumerable.FirstOrDefault(actions, action => action.Title.IndexOf("桌面", StringComparison.OrdinalIgnoreCase) >= 0);
+                    if (desktopAction == null) ShowActionPanel(item, actions);
+                    else ExecuteQuickAction(item, desktopAction);
+                }
+                else ShowActionPanel(item, actions);
             }
             catch (Exception error)
             {
+                ExitRadialMode();
                 MessageBox.Show(this, error.Message, "DropOrb 无法处理", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            finally
+            {
+                radialItem = null;
+                radialActions = null;
             }
         }
 
@@ -215,9 +310,116 @@ namespace DropOrb
 
         private void ShowActionPanel(DropItem item, System.Collections.Generic.IList<ActionSpec> actions)
         {
-            var panel = new ActionPanelForm(item, actions, PanelAnchor());
+            var panel = new ActionPanelForm(item, actions, PanelAnchor(), jobs, action => engine.Remember(item.Kind, action));
             panel.Show();
             panel.Activate();
+        }
+
+        private void ExecuteQuickAction(DropItem item, ActionSpec action)
+        {
+            if (action.IsBackground) jobs.Enqueue(action.Title, () => action.BackgroundExecute(item));
+            else action.Execute(item, this);
+            engine.Remember(item.Kind, action);
+        }
+
+        private void EnterRadialMode()
+        {
+            if (radialMode) return;
+            compactBounds = Bounds;
+            var work = Screen.FromRectangle(compactBounds).WorkingArea;
+            var center = new Point(compactBounds.Left + compactBounds.Width / 2, compactBounds.Top + compactBounds.Height / 2);
+            var x = Math.Max(work.Left + 6, Math.Min(center.X - 125, work.Right - 256));
+            var y = Math.Max(work.Top + 6, Math.Min(center.Y - 125, work.Bottom - 256));
+            radialMode = true;
+            Bounds = new Rectangle(x, y, 250, 250);
+            using (var path = Theme.Rounded(new Rectangle(0, 0, Width, Height), 26)) ReplaceRegion(new Region(path));
+            radialHover = new Point(125, 125);
+            Invalidate();
+        }
+
+        private void ExitRadialMode()
+        {
+            if (!radialMode) return;
+            radialMode = false;
+            Bounds = compactBounds;
+            ApplyCircleRegion();
+            Invalidate();
+        }
+
+        private void PaintRadial(Graphics graphics)
+        {
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            graphics.Clear(Theme.Background);
+            using (var border = new Pen(Theme.Border, 1.4f))
+            using (var path = Theme.Rounded(new Rectangle(1, 1, Width - 3, Height - 3), 25))
+                graphics.DrawPath(border, path);
+
+            var zone = RadialZone(radialHover);
+            var recommendation = radialActions != null && radialActions.Count > 0 ? radialActions[0].Title : "推荐动作";
+            DrawRadialZone(graphics, new Rectangle(70, 12, 110, 52), "推荐", recommendation, zone == "recommend");
+            DrawRadialZone(graphics, new Rectangle(10, 91, 82, 62), "暂存", "临时架", zone == "shelf");
+            DrawRadialZone(graphics, new Rectangle(158, 91, 82, 62), "桌面", "复制副本", zone == "desktop");
+            DrawRadialZone(graphics, new Rectangle(70, 186, 110, 52), "更多", "查看全部动作", zone == "more");
+
+            var center = new Rectangle(89, 87, 72, 72);
+            using (var gradient = new LinearGradientBrush(center, Theme.Blue, Theme.Violet, 45f)) graphics.FillEllipse(gradient, center);
+            using (var pen = new Pen(Color.White, 2.5f))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                graphics.DrawLine(pen, 125, 103, 125, 132);
+                graphics.DrawLine(pen, 115, 122, 125, 132);
+                graphics.DrawLine(pen, 135, 122, 125, 132);
+            }
+            using (var font = new Font("Segoe UI", 6.5f, FontStyle.Bold))
+            using (var brush = new SolidBrush(Color.FromArgb(225, Color.White)))
+            using (var format = Centered()) graphics.DrawString("DROP", font, brush, new Rectangle(94, 135, 62, 14), format);
+        }
+
+        private static void DrawRadialZone(Graphics graphics, Rectangle bounds, string title, string hint, bool active)
+        {
+            using (var path = Theme.Rounded(bounds, 12))
+            using (var fill = new SolidBrush(active ? Color.FromArgb(41, 66, 93) : Theme.SurfaceHigh))
+            using (var border = new Pen(active ? Theme.Cyan : Theme.Border, active ? 2f : 1f))
+            {
+                graphics.FillPath(fill, path);
+                graphics.DrawPath(border, path);
+            }
+            using (var titleFont = new Font("Microsoft YaHei UI", 8.2f, FontStyle.Bold))
+            using (var hintFont = new Font("Microsoft YaHei UI", 6.8f))
+            using (var titleBrush = new SolidBrush(active ? Theme.Cyan : Theme.Text))
+            using (var hintBrush = new SolidBrush(Theme.Secondary))
+            using (var format = Centered())
+            {
+                graphics.DrawString(title, titleFont, titleBrush, new Rectangle(bounds.X + 3, bounds.Y + 5, bounds.Width - 6, 21), format);
+                var compactHint = hint.Length > 8 ? hint.Substring(0, 8) + "…" : hint;
+                graphics.DrawString(compactHint, hintFont, hintBrush, new Rectangle(bounds.X + 3, bounds.Y + 27, bounds.Width - 6, 18), format);
+            }
+        }
+
+        private static string RadialZone(Point point)
+        {
+            var dx = point.X - 125;
+            var dy = point.Y - 125;
+            if (Math.Abs(dx) < 45 && Math.Abs(dy) < 45) return "more";
+            if (Math.Abs(dx) > Math.Abs(dy)) return dx < 0 ? "shelf" : "desktop";
+            return dy < 0 ? "recommend" : "more";
+        }
+
+        private void ApplyCircleRegion()
+        {
+            using (var circle = new GraphicsPath())
+            {
+                circle.AddEllipse(0, 0, Width, Height);
+                ReplaceRegion(new Region(circle));
+            }
+        }
+
+        private void ReplaceRegion(Region value)
+        {
+            var previous = Region;
+            Region = value;
+            if (previous != null) previous.Dispose();
         }
 
         private void OnOrbMouseDown(object sender, MouseEventArgs args)
@@ -375,6 +577,44 @@ namespace DropOrb
             helpForm.Activate();
         }
 
+        private void ShowActivityCenter()
+        {
+            if (activityForm != null && !activityForm.IsDisposed)
+            {
+                activityForm.Activate();
+                return;
+            }
+            activityForm = new ActivityCenterForm(jobs, undoStore, PanelAnchor());
+            activityForm.FormClosed += delegate { activityForm = null; };
+            activityForm.Show();
+            activityForm.Activate();
+        }
+
+        private string ActivityTitle()
+        {
+            return jobs.RunningCount > 0 ? "任务与撤销  (" + jobs.RunningCount + " 进行中)" : "任务与撤销";
+        }
+
+        private void ResetPreferences()
+        {
+            if (MessageBox.Show(this, "清除已经学到的动作排序？", "重置动作偏好", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            engine.ResetPreferences();
+            Toast("动作偏好已重置", "之后会重新学习你的选择。 ");
+        }
+
+        private void OnJobCompleted(object sender, JobCompletedEventArgs args)
+        {
+            if (args.Error != null)
+            {
+                Toast("后台任务失败", args.Job.Title + "：" + args.Error.Message);
+                Invalidate();
+                return;
+            }
+            if (args.Result != null && !string.IsNullOrWhiteSpace(args.Result.ClipboardText)) Clipboard.SetText(args.Result.ClipboardText);
+            Toast(args.Job.Title + "完成", string.IsNullOrWhiteSpace(args.Job.Message) ? "已处理完成，可在任务中心查看。" : args.Job.Message);
+            Invalidate();
+        }
+
         private void ShowOrb()
         {
             Show();
@@ -441,6 +681,11 @@ namespace DropOrb
         private void OnFormClosed(object sender, FormClosedEventArgs args)
         {
             SaveLocation();
+            animationTimer.Stop();
+            animationTimer.Dispose();
+            radialLeaveTimer.Stop();
+            radialLeaveTimer.Dispose();
+            jobs.Completed -= OnJobCompleted;
             trayIcon.Visible = false;
             trayIcon.Dispose();
         }

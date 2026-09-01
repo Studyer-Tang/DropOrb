@@ -9,11 +9,15 @@ namespace DropOrb
     {
         private readonly DropItem item;
         private readonly IList<ActionSpec> actions;
+        private readonly JobManager jobs;
+        private readonly Action<ActionSpec> onExecuted;
 
-        public ActionPanelForm(DropItem dropItem, IList<ActionSpec> actionList, Point anchor)
+        public ActionPanelForm(DropItem dropItem, IList<ActionSpec> actionList, Point anchor, JobManager jobManager, Action<ActionSpec> executed)
         {
             item = dropItem;
             actions = actionList;
+            jobs = jobManager;
+            onExecuted = executed;
             var visibleActionCount = Math.Min(6, actions.Count);
             Text = "DropOrb Actions";
             ClientSize = new Size(338, 116 + visibleActionCount * 59);
@@ -100,10 +104,18 @@ namespace DropOrb
             var oldText = button.Text;
             try
             {
+                if (action.IsBackground)
+                {
+                    jobs.Enqueue(action.Title, () => action.BackgroundExecute(item));
+                    if (onExecuted != null) onExecuted(action);
+                    Close();
+                    return;
+                }
                 button.Enabled = false;
                 button.Text = "正在处理…";
                 Cursor = Cursors.WaitCursor;
                 action.Execute(item, this);
+                if (onExecuted != null) onExecuted(action);
                 Close();
             }
             catch (Exception error)
